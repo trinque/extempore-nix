@@ -47,5 +47,4 @@ Linux, `x86_64-linux` and `aarch64-linux`. Built and tested on
 
 ## License
 
-This repository's own files are in the public domain (see `LICENSE`).
-Extempore is BSD-3-Clause, and the patch modifies its build files.
+BSD-3-Clause, as Extempore is (see `LICENSE`).

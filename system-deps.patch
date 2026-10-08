@@ -1,0 +1,350 @@
+diff --git a/BUILDING.md b/BUILDING.md
+index b6e239f..2d4bb0b 100644
+--- a/BUILDING.md
++++ b/BUILDING.md
+@@ -46,6 +46,10 @@ users will care about:
+   (glfw, wgpu-native, stb_image). Required for the WebGPU examples.
+ - `JACK` (default `OFF`) --- use the Jack PortAudio backend on Linux instead of
+   ALSA.
++- `EXTEMPORE_SYSTEM_DEPS` (default `OFF`) --- use the installed LLVM, PCRE2,
++  PortAudio, audio libraries and GoogleTest instead of downloading and building
++  them. Linux and macOS only. See
++  [Using installed dependencies](#using-installed-dependencies).
+ - `EXTEMPORE_CCACHE` (default `ON`) --- route compilation through `ccache` when
+   it's installed. The sub-builds (LLVM, portaudio, sndfile, ...) inherit it, so
+   a second build directory costs minutes rather than half an hour.
+@@ -84,6 +88,32 @@ The xtlang compiler's type-string grammars use recursive subpatterns and named
+ groups, so a PCRE-compatible engine is a hard requirement rather than a
+ convenience.
+ 
++## Using installed dependencies
++
++By default the build downloads and compiles every dependency at the version
++pinned in `CMakeLists.txt`, which is what the release binaries are built from.
++A distribution package, or any build without network access, can use the
++system's copies instead:
++
++    cmake --preset default -DEXTEMPORE_SYSTEM_DEPS=ON
++
++Nothing is downloaded then, and these have to be installed:
++
++- LLVM in the pinned release series (22.1 at present), with its CMake package
++  and its static component libraries (`llvm-static` on Fedora). Any 22.1.x is
++  accepted. Extempore links the components statically, as it does its own.
++- PCRE2 and PortAudio, found through `pkg-config` (`libpcre2-8`,
++  `portaudio-2.0`).
++- portmidi, rtmidi, libsndfile and Extempore's
++  [fork of KISS FFT](https://github.com/extemporelang/kiss_fft), as shared
++  libraries. They are linked into `libs/platform-shlibs` rather than copied,
++  since that is where the xtlang bindings load them from.
++- GoogleTest, when `BUILD_TESTS` is on.
++
++`JACK` and `EXTERNAL_SHLIBS_GRAPHICS` are refused alongside it: the installed
++PortAudio's backends are whatever it was built with, and the WebGPU stack is
++still downloaded only.
++
+ ## Targets
+ 
+ The default target builds Extempore, all the dependencies, and AOT-compiles the
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bb15962..8529d04 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -43,6 +43,27 @@ endif()
+ option(EXTERNAL_SHLIBS_AUDIO "download & build audio-related external library dependencies" ON)
+ option(EXTERNAL_SHLIBS_GRAPHICS "WebGPU graphics (GLFW, wgpu-native, stb_image)" OFF)
+ option(JACK "use the Jack Portaudio backend (see BUILDING.md)" OFF)
++option(EXTEMPORE_SYSTEM_DEPS "use installed LLVM, PCRE2, PortAudio and audio libs instead of downloading them (see BUILDING.md)" OFF)
++
++# The installed-dependency build covers LLVM, PCRE2, PortAudio, the audio libs
++# and GoogleTest. The options below only mean something for the libraries this
++# build downloads, so refuse them rather than quietly ignoring them.
++if(EXTEMPORE_SYSTEM_DEPS)
++    if(WIN32)
++        message(FATAL_ERROR "EXTEMPORE_SYSTEM_DEPS is supported on Linux and macOS only")
++    endif()
++    if(JACK)
++        message(FATAL_ERROR
++            "JACK selects the backend of the PortAudio this build downloads. With "
++            "EXTEMPORE_SYSTEM_DEPS=ON the installed PortAudio's backends apply, so leave JACK off.")
++    endif()
++    if(EXTERNAL_SHLIBS_GRAPHICS)
++        message(FATAL_ERROR
++            "EXTEMPORE_SYSTEM_DEPS does not cover the WebGPU graphics stack; "
++            "turn off one of EXTERNAL_SHLIBS_GRAPHICS and EXTEMPORE_SYSTEM_DEPS.")
++    endif()
++    find_package(PkgConfig REQUIRED)
++endif()
+ 
+ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+@@ -186,19 +207,26 @@ endif()
+ # portaudio #
+ #############
+ 
+-include(ExternalProject)
+-
+-ExternalProject_Add(portaudio_static
+-    PREFIX portaudio
+-    URL https://github.com/PortAudio/portaudio/archive/${DEP_PORTAUDIO_VERSION}.zip
+-    URL_HASH SHA256=${DEP_PORTAUDIO_SHA256}
+-    LIST_SEPARATOR |
+-    CMAKE_ARGS
+-        -DPA_BUILD_SHARED_LIBS=OFF
+-        -DPA_USE_JACK=${JACK}
+-        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+-        -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/portaudio
+-        ${EXT_DEPS_TOOLCHAIN_ARGS})
++if(EXTEMPORE_SYSTEM_DEPS)
++    pkg_check_modules(PORTAUDIO REQUIRED IMPORTED_TARGET portaudio-2.0)
++    set(EXTEMPORE_PORTAUDIO_LIB PkgConfig::PORTAUDIO)
++else()
++    include(ExternalProject)
++
++    ExternalProject_Add(portaudio_static
++        PREFIX portaudio
++        URL https://github.com/PortAudio/portaudio/archive/${DEP_PORTAUDIO_VERSION}.zip
++        URL_HASH SHA256=${DEP_PORTAUDIO_SHA256}
++        LIST_SEPARATOR |
++        CMAKE_ARGS
++            -DPA_BUILD_SHARED_LIBS=OFF
++            -DPA_USE_JACK=${JACK}
++            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
++            -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/portaudio
++            ${EXT_DEPS_TOOLCHAIN_ARGS})
++    set(EXTEMPORE_PORTAUDIO_LIB portaudio${CMAKE_STATIC_LIBRARY_SUFFIX})
++    set(EXTEMPORE_PORTAUDIO_INCLUDE_DIRS ${CMAKE_BINARY_DIR}/portaudio/include)
++endif()
+ 
+ ########
+ # LLVM #
+@@ -229,39 +257,57 @@ if(POLICY CMP0168)
+     cmake_policy(SET CMP0168 NEW)
+ endif()
+ 
+-set(LLVM_TARGETS_TO_BUILD ${LLVM_TARGET_ARCH} CACHE STRING "" FORCE)
+-set(LLVM_ENABLE_TERMINFO OFF CACHE BOOL "" FORCE)
+-set(LLVM_ENABLE_ZLIB OFF CACHE BOOL "" FORCE)
+-set(LLVM_ENABLE_ZSTD OFF CACHE BOOL "" FORCE)
+-set(LLVM_ENABLE_LIBXML2 OFF CACHE BOOL "" FORCE)
+-set(LLVM_INCLUDE_TOOLS OFF CACHE BOOL "" FORCE)
+-set(LLVM_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+-set(LLVM_INCLUDE_UTILS OFF CACHE BOOL "" FORCE)
+-set(LLVM_BUILD_RUNTIME OFF CACHE BOOL "" FORCE)
+-set(LLVM_INCLUDE_EXAMPLES OFF CACHE BOOL "" FORCE)
+-set(LLVM_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
+-set(LLVM_INCLUDE_BENCHMARKS OFF CACHE BOOL "" FORCE)
+-set(LLVM_INCLUDE_DOCS OFF CACHE BOOL "" FORCE)
+-set(LLVM_ENABLE_BINDINGS OFF CACHE BOOL "" FORCE)
+-set(LLVM_ENABLE_OCAMLDOC OFF CACHE BOOL "" FORCE)
+-
+-FetchContent_Declare(LLVM
+-    URL https://github.com/llvm/llvm-project/releases/download/llvmorg-${DEP_LLVM_VERSION}/llvm-project-${DEP_LLVM_VERSION}.src.tar.xz
+-    URL_HASH SHA256=${DEP_LLVM_SHA256}
+-    SOURCE_SUBDIR llvm
+-    EXCLUDE_FROM_ALL)
+-
+-FetchContent_MakeAvailable(LLVM)
++if(EXTEMPORE_SYSTEM_DEPS)
++    # The installed LLVM must be the pinned release series: LLVM's package
++    # version file accepts a request only for its own major.minor.
++    string(REGEX MATCH "^[0-9]+\\.[0-9]+" _llvm_series ${DEP_LLVM_VERSION})
++    find_package(LLVM ${_llvm_series} REQUIRED CONFIG)
++    message(STATUS "Using installed LLVM ${LLVM_PACKAGE_VERSION} from ${LLVM_DIR}")
++else()
++    set(LLVM_TARGETS_TO_BUILD ${LLVM_TARGET_ARCH} CACHE STRING "" FORCE)
++    set(LLVM_ENABLE_TERMINFO OFF CACHE BOOL "" FORCE)
++    set(LLVM_ENABLE_ZLIB OFF CACHE BOOL "" FORCE)
++    set(LLVM_ENABLE_ZSTD OFF CACHE BOOL "" FORCE)
++    set(LLVM_ENABLE_LIBXML2 OFF CACHE BOOL "" FORCE)
++    set(LLVM_INCLUDE_TOOLS OFF CACHE BOOL "" FORCE)
++    set(LLVM_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
++    set(LLVM_INCLUDE_UTILS OFF CACHE BOOL "" FORCE)
++    set(LLVM_BUILD_RUNTIME OFF CACHE BOOL "" FORCE)
++    set(LLVM_INCLUDE_EXAMPLES OFF CACHE BOOL "" FORCE)
++    set(LLVM_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
++    set(LLVM_INCLUDE_BENCHMARKS OFF CACHE BOOL "" FORCE)
++    set(LLVM_INCLUDE_DOCS OFF CACHE BOOL "" FORCE)
++    set(LLVM_ENABLE_BINDINGS OFF CACHE BOOL "" FORCE)
++    set(LLVM_ENABLE_OCAMLDOC OFF CACHE BOOL "" FORCE)
++
++    FetchContent_Declare(LLVM
++        URL https://github.com/llvm/llvm-project/releases/download/llvmorg-${DEP_LLVM_VERSION}/llvm-project-${DEP_LLVM_VERSION}.src.tar.xz
++        URL_HASH SHA256=${DEP_LLVM_SHA256}
++        SOURCE_SUBDIR llvm
++        EXCLUDE_FROM_ALL)
++
++    FetchContent_MakeAvailable(LLVM)
++
++    set(LLVM_INCLUDE_DIRS
++        ${llvm_SOURCE_DIR}/llvm/include
++        ${llvm_BINARY_DIR}/include)
++endif()
+ 
+ # GoogleTest for C++ unit tests.
+ if(BUILD_TESTS)
+-    FetchContent_Declare(
+-        googletest
+-        URL https://github.com/google/googletest/archive/refs/tags/v${DEP_GOOGLETEST_VERSION}.tar.gz
+-        URL_HASH SHA256=${DEP_GOOGLETEST_SHA256})
+-    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+-    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+-    FetchContent_MakeAvailable(googletest)
++    if(EXTEMPORE_SYSTEM_DEPS)
++        find_package(GTest REQUIRED)
++        # tests/cpp-unit links the target name the downloaded GoogleTest defines.
++        add_library(gtest_main ALIAS GTest::gtest_main)
++    else()
++        FetchContent_Declare(
++            googletest
++            URL https://github.com/google/googletest/archive/refs/tags/v${DEP_GOOGLETEST_VERSION}.tar.gz
++            URL_HASH SHA256=${DEP_GOOGLETEST_SHA256})
++        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
++        set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
++        FetchContent_MakeAvailable(googletest)
++    endif()
+ endif()
+ 
+ #########
+@@ -272,28 +318,34 @@ endif()
+ # compiler's type-string grammars use recursive subpatterns and named groups,
+ # which std::regex has no answer for.
+ #
+-# Built as a static library and linked in, so nothing has to be shipped
+-# alongside the binary. pcre2-8-static carries PCRE2_STATIC as a PUBLIC compile
+-# definition, which is what keeps MSVC from decorating the API with
+-# __declspec(dllimport).
+-FetchContent_Declare(pcre2
+-    URL https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${DEP_PCRE2_VERSION}/pcre2-${DEP_PCRE2_VERSION}.tar.gz
+-    URL_HASH SHA256=${DEP_PCRE2_SHA256}
+-    SYSTEM
+-    EXCLUDE_FROM_ALL)
+-
+-set(PCRE2_BUILD_PCRE2GREP OFF CACHE BOOL "" FORCE)
+-set(PCRE2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+-set(PCRE2_SHOW_REPORT OFF CACHE BOOL "" FORCE)
+-set(PCRE2_STATIC_PIC ON CACHE BOOL "" FORCE)
+-
+-# BUILD_SHARED_LIBS picks which of the two builds `pcre2-8` aliases, so pin it
+-# for pcre2 alone rather than for the whole project.
+-block()
+-    set(BUILD_SHARED_LIBS OFF)
+-    set(BUILD_STATIC_LIBS ON)
+-    FetchContent_MakeAvailable(pcre2)
+-endblock()
++# Downloaded, it is built as a static library and linked in, so nothing has to
++# be shipped alongside the binary. pcre2-8-static carries PCRE2_STATIC as a
++# PUBLIC compile definition, which is what keeps MSVC from decorating the API
++# with __declspec(dllimport).
++if(EXTEMPORE_SYSTEM_DEPS)
++    pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
++    set(EXTEMPORE_PCRE2_LIB PkgConfig::PCRE2)
++else()
++    FetchContent_Declare(pcre2
++        URL https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${DEP_PCRE2_VERSION}/pcre2-${DEP_PCRE2_VERSION}.tar.gz
++        URL_HASH SHA256=${DEP_PCRE2_SHA256}
++        SYSTEM
++        EXCLUDE_FROM_ALL)
++
++    set(PCRE2_BUILD_PCRE2GREP OFF CACHE BOOL "" FORCE)
++    set(PCRE2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
++    set(PCRE2_SHOW_REPORT OFF CACHE BOOL "" FORCE)
++    set(PCRE2_STATIC_PIC ON CACHE BOOL "" FORCE)
++
++    # BUILD_SHARED_LIBS picks which of the two builds `pcre2-8` aliases, so pin
++    # it for pcre2 alone rather than for the whole project.
++    block()
++        set(BUILD_SHARED_LIBS OFF)
++        set(BUILD_STATIC_LIBS ON)
++        FetchContent_MakeAvailable(pcre2)
++    endblock()
++    set(EXTEMPORE_PCRE2_LIB pcre2-8)
++endif()
+ 
+ set(EXTEMPORE_LLVM_COMPONENTS
+     OrcJIT
+@@ -308,11 +360,9 @@ llvm_map_components_to_libnames(LLVM_LIBRARIES ${EXTEMPORE_LLVM_COMPONENTS})
+ message(STATUS "LLVM libraries: ${LLVM_LIBRARIES}")
+ 
+ # Target for building just LLVM (useful for CI caching)
+-add_custom_target(llvm-libs DEPENDS ${LLVM_LIBRARIES})
+-
+-set(LLVM_INCLUDE_DIRS
+-    ${llvm_SOURCE_DIR}/llvm/include
+-    ${llvm_BINARY_DIR}/include)
++if(NOT EXTEMPORE_SYSTEM_DEPS)
++    add_custom_target(llvm-libs DEPENDS ${LLVM_LIBRARIES})
++endif()
+ 
+ #############
+ # extempore #
+@@ -347,7 +397,7 @@ set(EXTEMPORE_SOURCES
+ 
+ add_executable(extempore ${EXTEMPORE_SOURCES})
+ 
+-add_dependencies(extempore s7_lib portaudio_static)
++add_dependencies(extempore s7_lib)
+ 
+ target_include_directories(extempore PRIVATE
+     include
+@@ -355,11 +405,15 @@ target_include_directories(extempore PRIVATE
+ 
+ target_include_directories(extempore SYSTEM PRIVATE
+     src/oscpp/include
+-    ${CMAKE_BINARY_DIR}/portaudio/include
++    ${EXTEMPORE_PORTAUDIO_INCLUDE_DIRS}
+     ${LLVM_INCLUDE_DIRS})
+ 
+-target_link_directories(extempore PRIVATE ${CMAKE_BINARY_DIR}/portaudio/lib)
+-target_link_libraries(extempore PRIVATE s7_lib pcre2-8 portaudio${CMAKE_STATIC_LIBRARY_SUFFIX} ${LLVM_LIBRARIES})
++if(NOT EXTEMPORE_SYSTEM_DEPS)
++    add_dependencies(extempore portaudio_static)
++    target_link_directories(extempore PRIVATE ${CMAKE_BINARY_DIR}/portaudio/lib)
++endif()
++
++target_link_libraries(extempore PRIVATE s7_lib ${EXTEMPORE_PCRE2_LIB} ${EXTEMPORE_PORTAUDIO_LIB} ${LLVM_LIBRARIES})
+ 
+ # Compile definitions
+ if(EXT_SHARE_DIR)
+diff --git a/extras/cmake/external_deps.cmake b/extras/cmake/external_deps.cmake
+index 3968832..d610612 100644
+--- a/extras/cmake/external_deps.cmake
++++ b/extras/cmake/external_deps.cmake
+@@ -1,6 +1,7 @@
+ # External shared library dependencies for Extempore
+ # Requires: EXTERNAL_SHLIBS_AUDIO, EXTERNAL_SHLIBS_GRAPHICS options
+-# Sets up: ExternalProject targets and platform-shlibs copy targets
++# Sets up: ExternalProject targets and platform-shlibs copy targets, or with
++# EXTEMPORE_SYSTEM_DEPS links to the installed audio libs
+ 
+ if(NOT (EXTERNAL_SHLIBS_AUDIO OR EXTERNAL_SHLIBS_GRAPHICS))
+     return()
+@@ -38,7 +39,27 @@ function(extempore_add_external name)
+     set_target_properties(${name} PROPERTIES FOLDER ${ARG_FOLDER})
+ endfunction()
+ 
+-if(EXTERNAL_SHLIBS_AUDIO)
++if(EXTERNAL_SHLIBS_AUDIO AND EXTEMPORE_SYSTEM_DEPS)
++    # The xtlang bindings dlopen these from libs/platform-shlibs by their
++    # unversioned names, so link each installed library there under that name.
++    # The link points at the real file, because on most distributions the
++    # unversioned name belongs to the -dev package. kiss_fft is Extempore's
++    # fork (github.com/extemporelang/kiss_fft), not upstream KISS FFT.
++    set(_audio_shlib_links "")
++    foreach(_lib kiss_fft portmidi rtmidi sndfile)
++        string(TOUPPER ${_lib} _var)
++        find_library(${_var}_LIBRARY ${_lib} REQUIRED)
++        file(REAL_PATH ${${_var}_LIBRARY} _real)
++        list(APPEND _audio_shlib_links
++            COMMAND ${CMAKE_COMMAND} -E create_symlink ${_real}
++                ${EXT_PLATFORM_SHLIBS_DIR}/lib${_lib}${CMAKE_SHARED_LIBRARY_SUFFIX})
++    endforeach()
++    add_custom_target(external_shlibs_audio
++        COMMENT "Linking installed audio shared libs into ${EXT_PLATFORM_SHLIBS_DIR}"
++        COMMAND ${CMAKE_COMMAND} -E make_directory ${EXT_PLATFORM_SHLIBS_DIR}
++        ${_audio_shlib_links})
++    set_target_properties(external_shlibs_audio PROPERTIES FOLDER EXTERNAL_SHLIBS)
++elseif(EXTERNAL_SHLIBS_AUDIO)
+     extempore_add_external(portmidi
+         URL https://github.com/PortMidi/portmidi/archive/${DEP_PORTMIDI_VERSION}.zip
+         URL_SHA256 ${DEP_PORTMIDI_SHA256}
